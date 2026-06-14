@@ -140,7 +140,6 @@ For the specific dump this was reconstructed against, the boot decision resolves
    └─ ld/
        └─ lpc43xx_spifi_boot.ld ← 64 KB image @0x14000000, RAM relocation to
                                    0x10014000, device-key slot fixed @0x14000218
-decrypt_firmware.js             ← host-side firmware decryptor
 ```
 
 ---
@@ -732,26 +731,6 @@ plaintext footer at slot+0xBFC0 (0x1403BFC0): "CODE", length 0xAEE8
 ```
 
 If those four match, the cipher reconstruction is **bit-exact**; the SPIFI half is then just the imported library doing read/program/erase against `0x14000000`.
-
-### `decrypt_firmware.js`
-
-`decrypt_firmware.js` is a host-side Node.js helper for extracting and decrypting application firmware images from a **full SPI-NOR flash dump**:
-
-```sh
-node decrypt_firmware.js <full_dump.bin> [output_dir]
-```
-
-The script reads everything it needs from the dump itself: Key A at file offset `0x2F70`, Key B at `0x2F80`, and the optional per-device key slot at `0x218` when that slot is neither all-`0x00` nor all-`0xFF`. It scans 64 KB-aligned candidate slots for the cleartext header magic at image offset `0x200`, tries the loader's key order (Key B/device first, then Key A), validates the decrypted checksum, and writes one output per distinct encrypted image.
-
-By default output files go to `./decrypted/` and are named like:
-
-```text
-decrypted_14030000_keyB.bin
-```
-
-The stdout report also prints the selected key, decrypted MSP, entry address, and plaintext SHA-256 prefix for each validated image.
-
----
 
 ## 23. Security analysis
 
