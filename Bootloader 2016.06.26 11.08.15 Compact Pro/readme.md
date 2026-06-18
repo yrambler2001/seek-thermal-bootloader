@@ -2,7 +2,9 @@
 
 **A reverse-engineered and reconstructed first-stage bootloader for the Seek Thermal Compact Pro (Android variant, product code UQ-AAA), built on NXP LPC43xx (ARM Cortex-M4) and running from external SPIFI flash.**
 
-This repository is a from-scratch C reconstruction of the Compact Pro (Android) LPC43xx boot image, recovered by disassembling a 4 MB SPI-NOR flash dump. The reconstruction is faithful to the original machine code (the disassembly is the source of truth). The dump contains no function symbols; the labels here were assigned manually during analysis from behavior and call context, then kept consistent so the source lines up 1:1 with the listing.
+This repository is a from-scratch C reconstruction of the Compact Pro (Android) LPC43xx boot image, recovered by disassembling a 4 MB SPI-NOR flash dump. The reconstruction is **strictly faithful to the original machine code** (the disassembly is the source of truth): it reproduces only what the instructions actually do, with no idealised CRT0, staging, or bounds-checking that the binary does not contain. The dump carries no function symbols; the labels here were assigned manually during analysis from behavior and call context, then kept consistent so the source lines up 1:1 with the listing.
+
+This image is the near-twin of the **Compact Pro FF (LQ-XXX)** build documented in the sibling repository — the two were compiled 31 seconds apart. This repo is intentionally structured as a minimal _patch_ of that one: identical file layout, comments, and code organisation, differing only where the two binaries genuinely differ. See [§24](#24-relationship-to-the-sibling-builds).
 
 ---
 
@@ -31,7 +33,7 @@ This repository is a from-scratch C reconstruction of the Compact Pro (Android) 
 21. [Intentional oddities preserved from the binary](#21-intentional-oddities-preserved-from-the-binary)
 22. [Verifying the reconstruction](#22-verifying-the-reconstruction)
 23. [Security analysis](#23-security-analysis)
-24. [Relationship to the 2019 iOS build](#24-relationship-to-the-2019-ios-build)
+24. [Relationship to the sibling builds](#24-relationship-to-the-sibling-builds)
 25. [Known issues / TODO](#25-known-issues--todo)
 26. [Glossary](#26-glossary)
 27. [References](#27-references)
@@ -82,9 +84,10 @@ This build is unusual in two respects that shape the whole repo: it runs its **e
 | Mapped base            | `0x14000000` (SPIFI memory-mapped external SPI-NOR)                                |
 | Initial SP (MSP)       | `0x10018000`                                                                       |
 | Reset vector           | `0x14000265` (Thumb), i.e. `Reset_Handler` at `0x14000264`                         |
+| Reset prologue         | `PUSH {R4-R11,LR}` (the FF sibling pushes `{R4-R7,LR}`)                            |
 | Application region     | `0x10000000`–`0x10010000` (64 KB)                                                  |
 | Bootloader RAM runtime | `0x10010000`–`0x10018000` (32 KB: imported driver + data + bss + stack)            |
-| Cipher                 | software xorshift128 (Marsaglia), shift triple 11/19/8                             |
+| Cipher                 | software xorshift128 (Marsaglia), shift triple 11/19/8 (inlined, no standalone)    |
 | Key whitening          | **none** (seeds taken from key words directly)                                     |
 | Acceptance test        | 32-bit decrypted-word checksum `== 0x00000000`                                     |
 | Keys                   | two embedded (Key A = transport, Key B = at-rest) + optional silicon-derived Key B |
@@ -108,32 +111,43 @@ For the specific dump this was reconstructed against, the boot decision resolves
 ## 5. Repository layout
 
 ```
-CompactPro_43X0_Bootloader/                  ← workspace
-│
-├─ lpc_chip_43xx/                             ← LPCOpen chip library      [IMPORT, unchanged]
-│  ├─ inc/   chip.h, cmsis.h, core_cm4.h,
-│  │         scu_18xx_43xx.h, rgu_18xx_43xx.h, creg_18xx_43xx.h, …
+80K_43X0_Bootloader/                       ← workspace (folder name carried over;
+│                                            comments use "CompactPro_43X0_Bootloader")
+├─ lpc_chip_43xx/                           ← LPCOpen chip library      [IMPORT, unchanged]
+│  ├─ inc/   chip.h, cmsis.h, core_cm4.h, scu/rgu/creg headers, …
 │  └─ src/   (CMSIS + the few peripheral TUs actually linked)
 │
-├─ spifi_driver_blob/                         ← bespoke SPIFI driver      [IMPORT, black box]
-│  └─ (relocated code+data blob; flash 0x14000BE8 → RAM 0x10010000, 0x1D70 bytes;
-│      ~40 spifi_* / memcpy_fast routines; NOT NXP lpcspifilib)
+├─ spifi_driver_blob/                       ← bespoke SPIFI driver  [RECONSTRUCTED, best-effort]
+│  ├─ spifi_regs.h      ← controller regs + inferred device-descriptor struct + opcodes
+│  ├─ spifi_cmd.c       ← memcpy_fast + command primitives                [clean]
+│  ├─ spifi_mem.c       ← enter/exit XIP, wait_program_done, write_status [clean]
+│  ├─ spifi_sfdp.c      ← read_sfdp, sum_sfdp_params, get_read_count,
+│  │                       detect_4byte_addr, set_capacity                [clean]
+│  ├─ spifi_modes.c     ← configure_modes [clean] + block_protect_engine [structural]
+│  ├─ spifi_program.c   ← check_range, erase_cmd, program_setup/_pages,
+│  │                       find_nonff_word, addr_aligned, verify_*,
+│  │                       program_region                                 [clean]
+│  ├─ spifi_vendor.c    ← cfg_micron(+_2)/_a [clean]; winbond_spansion,
+│  │                       read_cr, sst, macronix, dummy_b   [byte-derived, weakest]
+│  └─ spifi_probe.c     ← init/probe dispatcher + 3 RAM entries +
+│                          memcpy_bytes_thunk                 [byte-derived, inferred]
+│  (relocated code+data; flash 0x14000BE8 → RAM 0x10010000, 0x1D70 bytes; NOT lpcspifilib)
 │
-└─ bootloader/                                ← THE APPLICATION           [RECONSTRUCT]
+└─ bootloader/                              ← THE APPLICATION           [RECONSTRUCT]
    ├─ inc/
    │   └─ bootloader.h          ← memory map, magic numbers, slot table, request ABI, prototypes
    ├─ src/
-   │   ├─ startup_lpc43xx.c     ← g_pfnVectors[], the full monolithic Reset_Handler
-   │   │                          (CRT0 + mailbox + spifi_init + A→B migration + slot
-   │   │                          select + segmented load + handoff), spin fault handlers,
-   │   │                          IRQ52_Handler catch-all, scatterload_copy_words
+   │   ├─ startup_lpc43xx.c     ← g_pfnVectors[], the full Reset_Handler (minimal CRT0 +
+   │   │                          mailbox + spifi_init + A→B migration + slot select +
+   │   │                          segmented load + handoff), spin fault handlers,
+   │   │                          IRQ52_Handler, scatterload_copy_words
    │   ├─ boot_main.c           ← select_boot_slot, image_try_keys / _copy2,
    │   │                          image_checksum_ok / _copy2, memzero_words
    │   ├─ crypto_stream.c       ← prng_seed_from_key, stream_checksum16 / _copy2,
-   │   │                          stream_reencrypt_keyA_to_keyB, stream_decrypt_skip_header_*,
-   │   │                          stream_decrypt_segment (xorshift128 inlined)
-   │   ├─ flash_if.c            ← spifi_init (pin-mux + request marshalling), flash_program,
-   │   │                          flash_erase_region, flash_program_rmw, flash_chip_erase
+   │   │                          stream_reencrypt_keyA_to_keyB, stream_decrypt_skip_header,
+   │   │                          stream_decrypt_segment (xorshift128 inlined static)
+   │   ├─ flash_if.c            ← spifi_init, flash_program, flash_erase_region,
+   │   │                          flash_program_rmw, flash_chip_erase
    │   ├─ spifi_glue.c          ← imported-driver request ABI + context + the three thunks
    │   ├─ keys.c                ← g_key_mask (Key A), g_keyB, g_boot_config_ptr, g_build_info
    │   └─ util_mem.c            ← memcpy_auto, memcpy_bytes
@@ -148,9 +162,11 @@ CompactPro_43X0_Bootloader/                  ← workspace
 
 The disassembly resolves on the order of **75 routines**:
 
-- **The SPIFI driver portion is a bespoke blob and is imported, not rewritten.** This is the ~40 routines the analysis labelled `spifi_cmd*`, `spifi_make_cmd`, `spifi_write_enable` / `spifi_wren_then_cmd`, `spifi_enter_mem_mode` / `spifi_exit_mem_mode`, `spifi_read_sfdp` / `spifi_sum_sfdp_params` / `spifi_get_read_count`, `spifi_detect_4byte_addr`, `spifi_set_capacity`, `spifi_configure_modes`, `spifi_block_protect_engine`, `spifi_check_range`, `spifi_erase_cmd`, `spifi_program_setup` / `spifi_program_pages` / `spifi_program_region`, `spifi_find_nonff_word`, `spifi_addr_aligned`, `spifi_verify_equal` / `spifi_verify_erased`, `spifi_wait_program_done`, `spifi_write_status`, the per-vendor config paths `spifi_cfg_micron` / `_micron_2` / `_winbond_spansion` / `_read_cr` / `_sst` / `_macronix`, the `spifi_dummy_from_freq_*` timing helpers, plus `memcpy_fast` and `memcpy_bytes_thunk`. This driver is **not** NXP lpcspifilib — it pokes the SPIFI registers at `0x40003000` directly and switches on the JEDEC ID per vendor. It is treated as a black box: a relocated blob that gives you read/program/erase against `0x14000000`.
-
-- **The bootloader-specific functions are reconstructed.** The startup/CRT0 and its fused boot pipeline (`Reset_Handler`), the spin fault/trap handlers, the boot leaves (`select_boot_slot`, `image_try_keys`, `image_try_keys_copy2`, `image_checksum_ok`, `image_checksum_ok_copy2`, `memzero_words`), the stream cipher (`prng_seed_from_key`, `stream_checksum16` / `_copy2`, `stream_reencrypt_keyA_to_keyB`, `stream_decrypt_skip_header_entry` / `_body`, `stream_decrypt_segment`), the flash wrapper layer (`spifi_init`, `flash_program`, `flash_erase_region`, `flash_program_rmw`, `flash_chip_erase`), the three driver thunks (`spifi_drv_init_thunk`, `spifi_drv_program_thunk`, `spifi_drv_op_thunk`), the small mem helpers (`memcpy_auto`, `memcpy_bytes`), and the embedded key/config data.
+- **The SPIFI driver portion is a bespoke blob and is now reconstructed (best-effort), not merely imported.** It is **not** NXP lpcspifilib — it pokes the SPIFI registers at `0x40003000` directly and switches per vendor by JEDEC ID. The earlier revision of this repo treated it as an opaque relocated blob; it is now reconstructed to C in `spifi_driver_blob/` at three confidence tiers, flagged per file and per function:
+  - **Clean** (lifted to instructions, faithful): `memcpy_fast`, all of `spifi_cmd.c`, `spifi_mem.c`, `spifi_sfdp.c`, `spifi_configure_modes`, and all of `spifi_program.c`.
+  - **Structural** (lifted, but dense/table-driven — behaviour faithful, not bit-exact): `spifi_block_protect_engine`.
+  - **Byte-derived** (hand-disassembled from raw `DCB`, or inferred from the call graph for the relocated RAM entries — documentation-grade, **not** bit-verifiable): the `spifi_cfg_winbond_spansion` / `_read_cr` / `_sst` / `_macronix` and `spifi_dummy_from_freq_b` vendor paths, and the whole of `spifi_probe.c` (the init/probe dispatcher and the three RAM entry points `0x100105FF`/`0x10010E95`/`0x100110EB`).
+- To build a **runnable** image, keep the original relocated blob bytes for the byte-derived regions (flash `~0x14001CE0`–`0x14002948`) rather than compiling those; the clean tiers can be compiled and compared against the listing. The device-descriptor struct (`spifi_dev_t`) is inferred — field offsets are confirmed against the accesses, field _meanings_ past the JEDEC/quad/erase fields are best-effort.- **The bootloader-specific functions are reconstructed.** The startup/CRT0 and its fused boot pipeline (`Reset_Handler`), the spin fault/trap handlers, the boot leaves (`select_boot_slot`, `image_try_keys`, `image_try_keys_copy2`, `image_checksum_ok`, `image_checksum_ok_copy2`, `memzero_words`), the stream cipher (`prng_seed_from_key`, `stream_checksum16` / `_copy2`, `stream_reencrypt_keyA_to_keyB`, `stream_decrypt_skip_header`, `stream_decrypt_segment`), the flash wrapper layer (`spifi_init`, `flash_program`, `flash_erase_region`, `flash_program_rmw`, `flash_chip_erase`), the three driver thunks, the small mem helpers (`memcpy_auto`, `memcpy_bytes`), and the embedded key/config data.
 
 A practical consequence: **the bootloader-specific logic is the entire attack/patch surface.** Everything behind the three thunks is vendor plumbing.
 
@@ -160,50 +176,52 @@ A practical consequence: **the bootloader-specific logic is the entire attack/pa
 
 The dump contains no function symbols. The labels below were assigned manually during analysis from each routine's behavior and call context, then kept consistent so the source compares directly with the listing. Addresses are flash/image addresses; the relocated driver routines map into RAM at `0x10010000` (see [§10](#10-memory-map)).
 
-| Address      | Function label                     |     | Address      | Function label                |
-| ------------ | ---------------------------------- | --- | ------------ | ----------------------------- |
-| `0x14000260` | `IRQ52_Handler`                    |     | `0x14000c72` | `spifi_quad_opt_bits`         |
-| `0x14000264` | `Reset_Handler`                    |     | `0x14000c82` | `spifi_cmd`                   |
-| `0x14000564` | `NMI_Handler`                      |     | `0x14000ca4` | `spifi_cmd_addr`              |
-| `0x14000568` | `HardFault_Handler`                |     | `0x14000cb6` | `spifi_cmd_data`              |
-| `0x1400056c` | `MemManage_Handler`                |     | `0x14000ce2` | `spifi_write_enable`          |
-| `0x14000570` | `BusFault_Handler`                 |     | `0x14000ce8` | `spifi_wren_then_cmd`         |
-| `0x14000574` | `UsageFault_Handler`               |     | `0x14000d04` | `spifi_cmd_addr_data`         |
-| `0x14000578` | `SVC_Handler`                      |     | `0x14000d4e` | `spifi_exit_mem_mode`         |
-| `0x1400057c` | `DebugMon_Handler`                 |     | `0x14000d8e` | `spifi_wait_program_done`     |
-| `0x14000580` | `PendSV_Handler`                   |     | `0x14000e68` | `spifi_write_status`          |
-| `0x14000584` | `SysTick_Handler`                  |     | `0x14000e9a` | `spifi_enter_mem_mode`        |
-| `0x1400058c` | `scatterload_copy_words`           |     | `0x14000f2a` | `spifi_detect_4byte_addr`     |
-| `0x140005a8` | `memzero_words`                    |     | `0x14000f5c` | `spifi_sum_sfdp_params`       |
-| `0x140005c0` | `image_try_keys` (Key A)           |     | `0x14000f98` | `spifi_get_read_count`        |
-| `0x140005da` | `image_checksum_ok`                |     | `0x14000fb4` | `spifi_read_sfdp`             |
-| `0x140005fc` | `image_try_keys_copy2` (Key B)     |     | `0x14001024` | `spifi_set_capacity`          |
-| `0x14000616` | `image_checksum_ok_copy2`          |     | `0x1400103a` | `spifi_configure_modes`       |
-| `0x1400063c` | `spifi_init`                       |     | `0x140013b8` | `spifi_block_protect_engine`  |
-| `0x1400069c` | `flash_program`                    |     | `0x140017dc` | `spifi_check_range`           |
-| `0x140006d4` | `flash_erase_region`               |     | `0x14001824` | `spifi_erase_cmd`             |
-| `0x14000704` | `flash_program_rmw`                |     | `0x14001866` | `spifi_program_setup`         |
-| `0x14000728` | `flash_chip_erase`                 |     | `0x1400187e` | `spifi_program_pages`         |
-| `0x14000758` | `select_boot_slot`                 |     | `0x1400196e` | `spifi_find_nonff_word`       |
-| `0x1400080c` | `memcpy_auto`                      |     | `0x14001986` | `spifi_addr_aligned`          |
-| `0x14000844` | `memcpy_bytes`                     |     | `0x1400199c` | `spifi_verify_equal`          |
-| `0x14000858` | `prng_seed_from_key`               |     | `0x140019fe` | `spifi_verify_erased`         |
-| `0x140008c8` | `stream_checksum16` (Key A)        |     | `0x14001a7c` | `spifi_program_region`        |
-| `0x1400093c` | `stream_reencrypt_keyA_to_keyB`    |     | `0x1400208c` | `spifi_cfg_micron`            |
-| `0x140009f8` | `stream_decrypt_skip_header_entry` |     | `0x14002520` | `spifi_dummy_from_freq_a`     |
-| `0x140009fe` | `stream_decrypt_skip_header_body`  |     | `0x14002552` | `spifi_cfg_winbond_spansion`  |
-| `0x14000a70` | `stream_decrypt_segment`           |     | `0x14002698` | `spifi_cfg_read_cr`           |
-| `0x14000b3c` | `stream_checksum16_copy2` (Key B)  |     | `0x140026da` | `spifi_cfg_micron_2`          |
-| `0x14000bb8` | `spifi_drv_init_thunk`             |     | `0x14002784` | `spifi_cfg_sst`               |
-| `0x14000bc8` | `spifi_drv_program_thunk`          |     | `0x1400283c` | `spifi_dummy_from_freq_b`     |
-| `0x14000bd8` | `spifi_drv_op_thunk`               |     | `0x1400285a` | `spifi_cfg_macronix`          |
-| `0x14000be8` | `memcpy_fast` (driver blob)        |     | `0x14002948` | `memcpy_bytes_thunk` (driver) |
-| `0x14000c2a` | `spifi_cmd_read`                   |     |              |                               |
-| `0x14000c5c` | `spifi_make_cmd`                   |     |              |                               |
+| Address      | Function label                       |     | Address      | Function label                |
+| ------------ | ------------------------------------ | --- | ------------ | ----------------------------- |
+| `0x14000260` | `IRQ52_Handler`                      |     | `0x14000c72` | `spifi_quad_opt_bits`         |
+| `0x14000264` | `Reset_Handler`                      |     | `0x14000c82` | `spifi_cmd`                   |
+| `0x14000564` | `NMI_Handler`                        |     | `0x14000ca4` | `spifi_cmd_addr`              |
+| `0x14000568` | `HardFault_Handler`                  |     | `0x14000cb6` | `spifi_cmd_data`              |
+| `0x1400056c` | `MemManage_Handler`                  |     | `0x14000ce2` | `spifi_write_enable`          |
+| `0x14000570` | `BusFault_Handler`                   |     | `0x14000ce8` | `spifi_wren_then_cmd`         |
+| `0x14000574` | `UsageFault_Handler`                 |     | `0x14000d04` | `spifi_cmd_addr_data`         |
+| `0x14000578` | `SVC_Handler`                        |     | `0x14000d4e` | `spifi_exit_mem_mode`         |
+| `0x1400057c` | `DebugMon_Handler`                   |     | `0x14000d8e` | `spifi_wait_program_done`     |
+| `0x14000580` | `PendSV_Handler`                     |     | `0x14000e68` | `spifi_write_status`          |
+| `0x14000584` | `SysTick_Handler`                    |     | `0x14000e9a` | `spifi_enter_mem_mode`        |
+| `0x1400058c` | `scatterload_copy_words`             |     | `0x14000f2a` | `spifi_detect_4byte_addr`     |
+| `0x140005a8` | `memzero_words`                      |     | `0x14000f5c` | `spifi_sum_sfdp_params`       |
+| `0x140005c0` | `image_try_keys` (Key A)             |     | `0x14000f98` | `spifi_get_read_count`        |
+| `0x140005da` | `image_checksum_ok`                  |     | `0x14000fb4` | `spifi_read_sfdp`             |
+| `0x140005fc` | `image_try_keys_copy2` (Key B)       |     | `0x14001024` | `spifi_set_capacity`          |
+| `0x14000616` | `image_checksum_ok_copy2`            |     | `0x1400103a` | `spifi_configure_modes`       |
+| `0x1400063c` | `spifi_init`                         |     | `0x140013b8` | `spifi_block_protect_engine`  |
+| `0x1400069c` | `flash_program`                      |     | `0x140017dc` | `spifi_check_range`           |
+| `0x140006d4` | `flash_erase_region`                 |     | `0x14001824` | `spifi_erase_cmd`             |
+| `0x14000704` | `flash_program_rmw`                  |     | `0x14001866` | `spifi_program_setup`         |
+| `0x14000728` | `flash_chip_erase`                   |     | `0x1400187e` | `spifi_program_pages`         |
+| `0x14000758` | `select_boot_slot`                   |     | `0x1400196e` | `spifi_find_nonff_word`       |
+| `0x1400080c` | `memcpy_auto`                        |     | `0x14001986` | `spifi_addr_aligned`          |
+| `0x14000844` | `memcpy_bytes`                       |     | `0x1400199c` | `spifi_verify_equal`          |
+| `0x14000858` | `prng_seed_from_key`                 |     | `0x140019fe` | `spifi_verify_erased`         |
+| `0x140008c8` | `stream_checksum16` (Key A)          |     | `0x14001a7c` | `spifi_program_region`        |
+| `0x1400093c` | `stream_reencrypt_keyA_to_keyB`      |     | `0x1400208c` | `spifi_cfg_micron`            |
+| `0x140009f8` | `stream_decrypt_skip_header` _entry_ |     | `0x14002520` | `spifi_dummy_from_freq_a`     |
+| `0x140009fe` | `stream_decrypt_skip_header` _body_  |     | `0x14002552` | `spifi_cfg_winbond_spansion`  |
+| `0x14000a70` | `stream_decrypt_segment`             |     | `0x14002698` | `spifi_cfg_read_cr`           |
+| `0x14000b3c` | `stream_checksum16_copy2` (Key B)    |     | `0x140026da` | `spifi_cfg_micron_2`          |
+| `0x14000bb8` | `spifi_drv_init_thunk`               |     | `0x14002784` | `spifi_cfg_sst`               |
+| `0x14000bc8` | `spifi_drv_program_thunk`            |     | `0x1400283c` | `spifi_dummy_from_freq_b`     |
+| `0x14000bd8` | `spifi_drv_op_thunk`                 |     | `0x1400285a` | `spifi_cfg_macronix`          |
+| `0x14000be8` | `memcpy_fast` (driver blob)          |     | `0x14002948` | `memcpy_bytes_thunk` (driver) |
+| `0x14000c2a` | `spifi_cmd_read`                     |     |              |                               |
+| `0x14000c5c` | `spifi_make_cmd`                     |     |              |                               |
 
-> **Rename:** the disassembly labels `0x1400093c` as a third `stream_decrypt_skip_header`. It is renamed here to **`stream_reencrypt_keyA_to_keyB`** — it runs two keystreams in lockstep (Key A from the mask block, Key B via `prng_seed_from_key`) and emits `out = cipher ^ ksA ^ ksB`, converting a transport image to its at-rest form. See [§15](#15-cryptographic-scheme) and the file header in `crypto_stream.c`.
+> **Rename:** the disassembly labels `0x1400093c` as a third `stream_decrypt_skip_header`. It is renamed here to **`stream_reencrypt_keyA_to_keyB`** — it runs two keystreams in lockstep (Key A from the mask block, Key B via `prng_seed_from_key`) and emits `out = cipher ^ ksA ^ ksB`, converting a transport image to its at-rest form. See [§15](#15-cryptographic-scheme).
+>
+> The single-key decryptor at `0x140009f8`/`0x140009fe` is labelled `_entry`/`_body` by the disassembler — these are two entry points that share a single stack frame (`_entry` does early null/align checks then falls into `_body`'s `PUSH`). In source it is one routine, `stream_decrypt_skip_header(dst, src, byte_len)`, seeding Key B internally.
 
-The driver-blob entries (`memcpy_fast` onward, from `0x14000be8`) are imported and not reproduced as source; they relocate into RAM at `0x10010000`. `memcpy_bytes_thunk` (`0x14002948`) is the one that relocates into RAM but branches **back** to `memcpy_bytes` in flash (`0x14000844`).
+The driver-blob entries (`memcpy_fast` onward, from `0x14000be8`) are now reconstructed in `spifi_driver_blob/` rather than imported — see [§6](#6-what-is-reconstructed-vs-imported) for the per-function confidence tiers. They still relocate into RAM at `0x10010000`; `memcpy_bytes_thunk` (`0x14002948`) is the one that relocates into RAM but branches **back** to `memcpy_bytes` in flash (`0x14000844`).
 
 ---
 
@@ -221,7 +239,7 @@ The driver-blob entries (`memcpy_fast` onward, from `0x14000be8`) are imported a
 Create the workspace tree from [§5](#5-repository-layout):
 
 ```
-CompactPro_43X0_Bootloader/   (workspace)
+80K_43X0_Bootloader/   (workspace)
 ├─ lpc_chip_43xx/      →  Static Library  (LPCOpen chip lib, imported)
 ├─ spifi_driver_blob/  →  Object/Library  (the bespoke driver, imported as a blob)
 └─ bootloader/         →  Executable      (this reconstruction; references the above)
@@ -243,7 +261,7 @@ In the **bootloader** project properties:
 -nostartfiles -Wl,--gc-sections
 ```
 
-`-nostartfiles` because we supply `startup_lpc43xx.c`. `-fno-strict-aliasing` because the flash layer type-puns addresses freely. Unlike the 2019 iOS build, this `Reset_Handler` needs **no** `no-tree-loop-distribute-patterns` barrier: its scatter-load uses explicit flash-resident calls (`scatterload_copy_words`, `memzero_words`) rather than inline loops, so there is no memcpy/memset idiom for GCC to synthesize. See [§12](#12-boot-flow-end-to-end).
+`-nostartfiles` because we supply `startup_lpc43xx.c`. `-fno-strict-aliasing` because the flash layer type-puns addresses freely. The `Reset_Handler` scatter-load uses explicit flash-resident calls (`scatterload_copy_words`, `memzero_words`) rather than inline loops, so no `no-tree-loop-distribute-patterns` barrier is needed. See [§12](#12-boot-flow-end-to-end).
 
 ---
 
@@ -255,8 +273,9 @@ In the **bootloader** project properties:
 | ---------------------------- | ------------------------- | ------------------------------------------------------------ |
 | Bootloader image (this file) | `0x14000000`–`0x14010000` | 64 KB                                                        |
 | SPIFI driver blob            | `0x14000BE8`–`0x14002958` | `0x1D70` bytes; relocated to RAM `0x10010000`                |
-| `.data` (LMA)                | `0x1400297C`              | `0x160` bytes; copied to RAM `0x10011D70`                    |
 | Build-info block             | `0x14002958`              | 4-byte marker + build date/time; the info pointer to the app |
+| `.data` (LMA)                | `0x1400297C`              | `0x160` bytes; copied to RAM `0x10011D70`                    |
+| Boot-config pointer (LMA)    | `0x14002AB8`              | value `0x14010000` (`.data+0x13C`)                           |
 | Key A / mask (LMA)           | `0x14002ABC`              | 16 bytes (`.data+0x140`)                                     |
 | Key B fixed (LMA)            | `0x14002ACC`              | 16 bytes (`.data+0x150`)                                     |
 | Boot-config record           | `0x14010000`              | 16 bytes; first dword selects the slot                       |
@@ -273,13 +292,12 @@ Slots are `0x10000` (64 KB) apart. The boot-config base (`0x14010000`) is also h
            │  0x20C/210 = the warm-boot update mailbox, read at reset)
            │  64 KB application region
 0x10010000 ┤ SPIFI driver blob   (RAM copy of flash 0x14000BE8+, 0x1D70 bytes)
-0x10011D70 ┤ keys/config blob     (Key A @..EB0, Key B @..EC0; copied from 0x1400297C, 0x160)
+0x10011D70 ┤ keys/config blob     (cfg ptr @..EAC, Key A @..EB0, Key B @..EC0; from 0x1400297C, 0x160)
 0x10011ED0 ┤ BSS: SPIFI request struct (0x10011ED0) + driver context (0x10011EE4) — zeroed (0x94)
-0x10017800 ┤ 0xCDCDCDCD stack guard  ← MSP − 0x800
-0x10018000 ┘ MSP (bootloader stack top)
+0x10018000 ┘ MSP (bootloader stack top, == vector[0])
 ```
 
-Staging buffer: `0x20000000` (a separate AHB SRAM bank) — used for program data marshalling and the read-modify-write block buffer.
+Staging buffer: `0x20000000` (a separate AHB SRAM bank) — used for program-data marshalling. Unlike the idealised reconstruction, **no stack-guard canary is planted and the MSP is not re-set** in CRT0; the hardware-loaded MSP from `vector[0]` is used as-is.
 
 ### Flash ↔ RAM relocation formula (driver only)
 
@@ -295,7 +313,7 @@ This is how the three thunk targets (`0x100105FF`, `0x10010E95`, `0x100110EB`) a
 
 ## 11. The build identity
 
-This image embeds **no internal name string** (the 2019 iOS build embedded `80K_43X0_Bootloader`). The only identity baked in is a 4-byte marker `{01,02,00,00}` immediately followed by the build date/time `Jun 26 2016` / `11:08:15`, at flash `0x14002958`. The marker is read at runtime: `prng_seed_from_key` forms the big-endian composite `0x01020000` and compares it to `0x01010000` to choose the fixed-vs-silicon Key-B path (the composite exceeds the threshold, so the fixed key is used). The repository/workspace name `CompactPro_43X0_Bootloader` is therefore descriptive, anchored to the product code (UQ-AAA) and the build date. (`43X0` is an internal product/board designator carried over from the lineage; its precise meaning is not recoverable from the image alone.)
+This image embeds **no internal name string**. The only identity baked in is a 4-byte marker `{01,02,00,00}` immediately followed by the build date/time `Jun 26 2016` / `11:08:15`, at flash `0x14002958`. The marker is read at runtime: `prng_seed_from_key` forms the big-endian composite `0x01020000` and compares it to `0x01010000` to choose the fixed-vs-silicon Key-B path (the composite exceeds the threshold, so the fixed key is used). The repository/workspace name `CompactPro_43X0_Bootloader` is therefore descriptive, anchored to the product code (UQ-AAA) and the build date. (`43X0` is an internal product/board designator carried over from the lineage; its precise meaning is not recoverable from the image alone.)
 
 ---
 
@@ -312,16 +330,17 @@ On power-up the LPC43xx internal boot ROM runs, strapped to boot from SPIFI. It 
 
 ### Phase 1 — `Reset_Handler` runs the whole pipeline from flash
 
-There is no separate RAM stage. `Reset_Handler` does, in order:
+There is no separate RAM stage, and **no idealised CRT0**: there is no `M4MEMMAP` remap, no stack canary, and no `__set_MSP`. `VTOR` is written exactly once, at hand-off. `Reset_Handler` does, in order:
 
-1. **CRT0 prologue.** `CPSID i`; `CREG_M4MEMMAP = 0x10000000` (alias the local SRAM bank to address 0); `VTOR = 0x14000000` (flash vector table for now). Plant the `0xCDCDCDCD` guard at `0x10017800` (`MSP−0x800`); re-set `MSP = 0x10018000`. Pulse-reset peripherals (`RGU_RESET_CTRL0 = 0x10DF1000`, `RGU_RESET_CTRL1 = 0x01DFF7FF`); clear all NVIC pending (`ICPR0..7`).
-2. **Scatter-load** (three tables): copy `.data` (keys/config) `0x1400297C → 0x10011D70` (`0x160`); copy the SPIFI driver blob `0x14000BE8 → 0x10010000` (`0x1D70`); zero `.bss` `0x10011ED0` (`0x94`). The copies go through the flash-resident helper `scatterload_copy_words`; the zero through `memzero_words` — both flash-resident, so callable before the driver exists in RAM.
-3. **Warm-boot update mailbox.** Read the flag at `0x1000020C` (honored only if it is `0xAA55FF01` or `0xAA55FF02`) and the 64-bit gate at `0x10000210` (must be `≤ 0x752F`); if both valid, derive a non-zero rollback request and clear the mailbox.
-4. **`spifi_init`.** Pin-mux the SPIFI bus and bring the imported driver up into XIP through the init thunk.
-5. **Key-A → Key-B migration** (every boot, all three slots). For each slot, if it validates under **Key A** (`image_try_keys` — still transport/OTA form): copy the ciphertext to the staging buffer, re-key it in place with `stream_reencrypt_keyA_to_keyB` (`out = cipher ^ ksA ^ ksB`, header window preserved), erase the slot's 64 KB block (`flash_chip_erase`), and write the Key-B image back (`flash_program`). Subsequent boots see a Key-B slot.
-6. **`select_boot_slot`** with the rollback request from step 3 (`0` normally) — read the 16-byte config at `0x14010000` and resolve a slot via the Key-B gate `image_try_keys_copy2`.
-7. **Segmented load (Key B).** Decrypt the `0x2C0`-byte segment table; load pass-1 (4 descriptors), zero 4 BSS regions, load pass-2 (4 descriptors). Each segment reseeds Key B and is fast-forwarded to its absolute position.
-8. **Handoff.** Copy the first `0x200` bytes of the decrypted table to `0x10000000` (installs the app vector table); publish `0x10000200 = &build-info (0x14002958)`, `0x10000204 = config base (0x14010000)`, `0x10000208 = slot id (0=A,1=B,2=recovery)`; `VTOR = 0x10000000`; `CPSIE i`; jump the entry (segment-table word 132). Control never returns.
+1. **CRT0 prologue.** `CPSID i`. Read the warm-boot mailbox (below), then clear it.
+2. **Peripheral reset / NVIC clear.** `RGU_RESET_CTRL0 = 0x10DF1000`, `RGU_RESET_CTRL1 = 0x01DFF7FF`; clear all NVIC pending (`ICPR0..7`, written as eight explicit stores in this build).
+3. **Warm-boot update mailbox.** Read the flag at `0x1000020C` (honored only if it is `0xAA55FF01` or `0xAA55FF02`, i.e. `flag + 0x55AA00FF ≤ 1`) and the 64-bit gate at `0x10000210` (must be `≤ 0x752F`). The **raw flag value** is what is carried forward to `select_boot_slot` — it is _not_ remapped to a 1/2 index.
+4. **Scatter-load** (three-entry table at `0x14000240`): copy `.data` (keys/config) `0x1400297C → 0x10011D70` (`0x160`); zero `.bss` `0x10011ED0` (`0x94`); copy the SPIFI driver blob `0x14000BE8 → 0x10010000` (`0x1D70`). The copies go through the flash-resident helper `scatterload_copy_words`; the zero through `memzero_words` — both flash-resident, callable before the driver exists in RAM.
+5. **`spifi_init`.** Pin-mux the SPIFI bus and bring the imported driver up into XIP through the init thunk (passed the driver context).
+6. **Key-A → Key-B migration** (every boot, all three slots, **unrolled** inline). For each slot, if it validates under **Key A** (`image_try_keys` — still transport/OTA form): copy the ciphertext to the staging buffer, re-key it in place with `stream_reencrypt_keyA_to_keyB` (`out = cipher ^ ksA ^ ksB`, header window preserved), erase the slot's 64 KB block (`flash_chip_erase`), and write the Key-B image back (`flash_program`, staged flag 0). Subsequent boots see a Key-B slot.
+7. **`select_boot_slot`** with the raw mailbox flag (`0` normally) — read the 16-byte config selector at `0x14010000` (via the config pointer) and resolve a slot via the Key-B gate `image_try_keys_copy2`.
+8. **Segmented load (Key B).** Decrypt the `0x2C0`-byte segment table; load pass-1 (4 descriptors), zero 4 BSS regions, load pass-2 (4 descriptors). Each segment reseeds Key B and is fast-forwarded to its absolute position.
+9. **Handoff.** Copy the first `0x200` bytes of the decrypted table to `0x10000000` (installs the app vector table); publish `0x10000200 = &build-info (0x14002958)`, `0x10000204 = config base (0x14010000)`, `0x10000208 = slot id (0=A,1=B,2=recovery)`; `VTOR = 0x10000000`; `CPSIE i`; jump the entry (segment-table word 132). Control never returns. The MSP is **not** reloaded — the entry stub owns its stack.
 
 **Why a flash-resident driver-only relocation:** the migration and rollback paths erase and reprogram the SPIFI flash, which means leaving memory-mapped mode and driving the controller with explicit commands — you cannot fetch _driver_ instructions from flash while doing that. So only the driver is relocated to SRAM; the boot logic stays in flash and calls into the RAM driver through the three thunks when it needs command mode.
 
@@ -333,10 +352,10 @@ There is no rich error handling. A null slot base or a failed segment decrypt pa
 
 ```
 ROM      : map SPIFI @0x14000000; MSP=0x10018000; jump 0x14000264
-CRT0     : CPSID; M4MEMMAP=0x10000000; VTOR=0x14000000; canary@0x10017800; MSP=0x10018000
-           RGU reset; clear NVIC pending
-           copy .data ->0x10011D70; copy driver ->0x10010000; zero .bss @0x10011ED0
-mailbox  : flag@0x1000020C / gate@0x10000210 -> rollback request (none here)
+CRT0     : CPSID; (no M4MEMMAP, no canary, no MSP-reload)
+           mailbox flag@0x1000020C / gate@0x10000210 -> raw rollback flag (none here)
+           RGU reset; clear NVIC pending (ICPR0..7)
+           copy .data ->0x10011D70; zero .bss @0x10011ED0; copy driver ->0x10010000
 spifi    : pinmux P3_4..P3_8 (P3_3 unset, P3_4 written twice); driver up -> XIP (4 MB part)
 migration: all slots checked under Key A -> none in transport form -> SKIPPED
 select   : config selector blank -> slot A 0x14050000
@@ -351,7 +370,7 @@ app      : running from SRAM, owns 0x10000000..0x10018000
 
 ## 13. Image format
 
-An application image is a stream of 32-bit words, encrypted with the positional keystream cipher, with one cleartext landmark. **There is no monolithic path and no "CODE" footer** (both present in the 2019 iOS build); the loader always takes the segmented path.
+An application image is a stream of 32-bit words, encrypted with the positional keystream cipher, with one cleartext landmark. **There is no monolithic path and no "CODE" footer**; the loader always takes the segmented path.
 
 ### Cleartext header window (always plaintext)
 
@@ -363,7 +382,7 @@ Words **128–143** (byte offset **`0x200`–`0x23F`**, 64 bytes) are stored **v
 
 ### Segment table
 
-The loader decrypts a `0x2C0`-byte (176-word) table. The observed word offsets (the descriptor format is byte-confirmed for pass-1 against this dump; the BSS / pass-2 struct semantics are inferred by symmetry):
+The loader decrypts a `0x2C0`-byte (176-word) table. The observed word offsets (pass-1 byte-confirmed against this dump; BSS / pass-2 struct semantics inferred by symmetry):
 
 ```
 [128..143]  cleartext header window; word 132 = app entry pointer
@@ -372,7 +391,7 @@ The loader decrypts a `0x2C0`-byte (176-word) table. The observed word offsets (
 [164..175]  pass-2 load descriptors: 4 × { srcRef, dstVMA, byteLen }
 ```
 
-`srcRef` is an image-base-relative address; the read offset within the slot is `srcRef − 0x14000000`, passed as `image_offset` to `stream_decrypt_segment` (which fast-forwards the keystream by `image_offset/4` words and keeps the 16-word window at `[skip_words..skip_words+15]`, `skip_words = 0x80`). On this dump the first pass-1 descriptor is `{ 0x14009960, 0x10000000, 0x240 }` — i.e. read offset `0x9960`, load to the app vector base, length `0x240`.
+`srcRef` is an image-base-relative address; the read offset within the slot is `srcRef − 0x14000000`, passed as `image_offset` to `stream_decrypt_segment` (which fast-forwards the keystream by `image_offset/4` words and keeps the 16-word window at `[SEG_SKIP_WORDS..SEG_SKIP_WORDS+15]`, `SEG_SKIP_WORDS = 0x80`). On this dump the first pass-1 descriptor is `{ 0x14009960, 0x10000000, 0x240 }` — read offset `0x9960`, load to the app vector base, length `0x240`.
 
 ### SPIFI driver request ABI (program/erase)
 
@@ -381,32 +400,32 @@ The flash layer marshals one operation into a fixed struct (instance at `0x10011
 ```
 +0x00 flash_offset : target byte offset from 0x14000000
 +0x04 length       : byte count
-+0x08 stage_buf    : AHB staging buffer (0x20000000) for program data, or 0 for erase
-+0x0C sentinel     : 0 / 0xFFFFFFFF
++0x08 stage_buf    : AHB staging buffer (0x20000000) for program data, or 0
++0x0C sentinel     : 0
 +0x10 opcode       : 0x08 = program, 0x20 = erase
 ```
 
-The request ABI carries **no source pointer**, so program data is staged through `0x20000000` first; reads are plain XIP loads.
+The request ABI carries **no source pointer**, so program data is staged through `0x20000000` first by the caller; reads are plain XIP loads.
 
 ---
 
 ## 14. The slot system
 
-Three firmware slots plus a 16-byte config record drive selection. `select_boot_slot(update_flag)` reads the record at `0x14010000` and returns the chosen slot base.
+Three firmware slots plus a 16-byte config record drive selection. `select_boot_slot(update_flag)` reads the selector dword the config pointer points at (`*(0x10011EAC) == 0x14010000`, so it reads `*(0x14010000)`) and returns the chosen slot base.
 
 ### Selection logic (`update_flag == 0`, the normal call)
 
-The selector dword (`cfg[0]`) sets the preference order; each candidate is gated through the **Key-B** acceptance test `image_try_keys_copy2`:
+Each candidate is gated through the **Key-B** acceptance test `image_try_keys_copy2`:
 
 - **blank** (`0x00000000` or `0xFFFFFFFF`) → try **A**, then **B**, then **recovery**
 - **`1`** → prefer **B**, then **A**, then **recovery**
 - **any other value** (e.g. `2`) → prefer **recovery**, then **A**, then **B**
 
-The predicate is `(uint32_t)(cfg[0]-1) <= 0xFFFFFFFD`, false only for the two blank values — that is the whole "blank → prefer A" branch. (On this dump the record is all `0xFF`, so the blank branch is taken and slot A wins.)
+The last entry in each ordering is the unconditional fallback (returned even if it does not validate). On this dump the record is all `0xFF`, so the blank branch is taken and slot A wins.
 
 ### Rollback path (`update_flag != 0`)
 
-Driven by the warm-boot mailbox. It re-resolves the current slot, and if it is A or B, stamps the flag over that slot's header magic (invalidating it), forces the config selector to `2` via the read-modify-write path (`flash_program_rmw`, which preserves the rest of the config block), and returns recovery.
+Driven by the warm-boot mailbox; the **raw** flag value is passed in. It recursively re-resolves the current slot (`select_boot_slot(0)`), and if it is A or B, stamps the raw flag over that slot's header magic (invalidating it) and forces the config selector to `2` — **both writes via `flash_program_rmw`** — then returns recovery.
 
 ---
 
@@ -423,7 +442,7 @@ w = w ^ (w >> 19) ^ t ^ (t >> 8)
 return w                       ; one keystream word
 ```
 
-There is no standalone PRNG routine; this step is inlined into every stream routine.
+**There is no standalone PRNG routine in this image** — the step is inlined into every stream routine. (In `crypto_stream.c` it is written once as a file-local `static` for readability; the compiler is free to inline it back, reproducing the machine code. The FF sibling factored it into a real exported function — the one code-size difference between the two builds.)
 
 ### Key → seed transform
 
@@ -436,8 +455,6 @@ z = k3
 w = k0          ; key word 0 lands in w, not x
 ```
 
-(The 2019 iOS build XORed a fixed mask `0x13579BDF` into each of these; this image does not.)
-
 ### Two keys and the migration
 
 - **Key A** (transport/OTA): seeded directly from the 16-byte mask block. A slot in transport form validates only under Key A.
@@ -446,11 +463,11 @@ w = k0          ; key word 0 lands in w, not x
 
 ### Decryption — positional XOR
 
-Each ciphertext word is XORed with one keystream word; the PRNG is advanced for _every_ word (so keystream word N lines up with image word N), including the verbatim header window. `stream_decrypt_segment` fast-forwards by `image_offset/4` words so the keystream aligns to each segment's position.
+Each ciphertext word is XORed with one keystream word; the PRNG is advanced for _every_ word (so keystream word N lines up with image word N), including the verbatim header window. Sources are read **directly from the memory-mapped flash** (no scratch staging). `stream_decrypt_segment` fast-forwards by `image_offset/4` words so the keystream aligns to each segment's position.
 
 ### Integrity check
 
-`stream_checksum16` / `stream_checksum16_copy2` decrypt and sum all plaintext words into a 32-bit accumulator; the image is accepted only if that accumulator equals exactly **`0x00000000`** (the 2019 iOS build used `0x0000FFFF`). Each routine returns **two** sums through out-params — a raw-ciphertext sum (vestigial) and the decrypted sum; only the decrypted sum is checked. `_copy` keys Key A; `_copy2` keys Key B. The acceptance decision is the checksum alone (no decrypted-SP range check). For this dump, slot A sums to `0x1349A524` under Key A (reject) and exactly `0x00000000` under Key B (accept) — see [§22](#22-verifying-the-reconstruction).
+`stream_checksum16` / `stream_checksum16_copy2` decrypt and sum all plaintext words into a 32-bit accumulator; the image is accepted only if that accumulator equals exactly **`0x00000000`**. Each routine returns **two** sums through out-params — a raw-ciphertext sum (vestigial) and the decrypted sum; only the decrypted sum is checked. `image_checksum_ok` keys Key A; `image_checksum_ok_copy2` keys Key B. The acceptance decision is the checksum alone (no decrypted-SP range check). For this dump, slot A sums to `0x1349A524` under Key A (reject) and exactly `0x00000000` under Key B (accept) — see [§22](#22-verifying-the-reconstruction).
 
 ---
 
@@ -492,27 +509,27 @@ To decrypt a captured image: seed xorshift128 with the matching key's `[x,y,z,w]
 
 ### `bootloader.h`
 
-The single shared header: flash/RAM memory map, image-format magic numbers and offsets, slot bases, the SPIFI request ABI, return-code legend, build-marker thresholds, and prototypes for every reconstructed function. Pointers are real pointers; argument order/semantics preserved; the gotcha functions carry warning comments.
+The single shared header: flash/RAM memory map, image-format magic numbers and offsets, slot bases, the SPIFI request ABI, return-code legend, build-marker thresholds, and prototypes for every reconstructed function. Pointers are real pointers; argument order/semantics preserved; the gotcha functions carry warning comments. (`xorshift128_next` is **not** declared here — it is a file-local `static` in `crypto_stream.c`.)
 
 ### `startup_lpc43xx.c`
 
-`g_pfnVectors[]` and the fused `Reset_Handler` — CRT0 (vector remap, peripheral reset, NVIC clear, scatter-load via `scatterload_copy_words` + `memzero_words`), the warm-boot mailbox, `spifi_init`, the Key-A→Key-B migration sweep, `select_boot_slot`, the segmented decrypt/load, and the handoff. Plus the plain-spin core-fault handlers, the `IRQ52_Handler` catch-all (no live peripheral handlers in this image), and `scatterload_copy_words`. No relocation-barrier is needed (the copies are explicit flash-resident calls).
+`g_pfnVectors[]` and the `Reset_Handler` — minimal CRT0 (peripheral reset, NVIC clear, scatter-load via `scatterload_copy_words` + `memzero_words`), the warm-boot mailbox (raw flag), `spifi_init`, the unrolled Key-A→Key-B migration sweep, `select_boot_slot`, the segmented decrypt/load, and the handoff. Plus the plain-spin core-fault handlers, the `IRQ52_Handler` catch-all (no live peripheral handlers in this image), and `scatterload_copy_words`. No `M4MEMMAP`/canary/MSP setup; `VTOR` written only at handoff.
 
 ### `boot_main.c`
 
-The boot leaves: `select_boot_slot`, the two single-key gates `image_try_keys` (Key A) / `image_try_keys_copy2` (Key B), their checksum tails `image_checksum_ok` / `_copy2`, and `memzero_words`. The acceptance test is the keystream checksum alone (`== 0`). All flash-resident.
+The boot leaves: `select_boot_slot`, the two single-key gates `image_try_keys` (Key A) / `image_try_keys_copy2` (Key B), their separate checksum tails `image_checksum_ok` / `_copy2`, and `memzero_words`. The acceptance test is the keystream checksum alone (`== 0`). All flash-resident.
 
 ### `crypto_stream.c`
 
-The keystream cipher: `prng_seed_from_key` (Key-B seeder with the fixed/silicon branch), `stream_checksum16` / `_copy2`, `stream_reencrypt_keyA_to_keyB` (the dual-key migration transform), `stream_decrypt_skip_header_entry` / `_body`, `stream_decrypt_segment`. Verified byte-for-byte against the dump (no-whitening seed, 11/19/8 shifts, verbatim window, 32-bit sentinel-0 checksum). The checksum and decrypt loops are deliberately the same loop differing only by store-vs-accumulate.
+The keystream cipher: `prng_seed_from_key` (Key-B seeder with the fixed/silicon branch), `stream_checksum16` / `_copy2`, `stream_reencrypt_keyA_to_keyB` (the dual-key migration transform), `stream_decrypt_skip_header`, `stream_decrypt_segment`. The xorshift step is an inlined `static`. Verified byte-for-byte against the dump (no-whitening seed, 11/19/8 shifts, verbatim window, 32-bit sentinel-0 checksum, direct XIP reads). The checksum and decrypt loops are deliberately the same loop differing only by store-vs-accumulate.
 
 ### `flash_if.c`
 
-The flash-access layer: `spifi_init` (pin-mux + request marshalling), `flash_program`, `flash_erase_region`, `flash_program_rmw`, `flash_chip_erase`. Program data is staged through `0x20000000`; reads are XIP. **No** read-back verify on program and **no** blank-verify on erase. All real flash work goes through the three thunks.
+The flash-access layer: `spifi_init` (pin-mux + request marshalling), `flash_program` (4-arg, sentinel 0, no internal memcpy, no bounds check — data pre-staged by the caller), `flash_erase_region`, `flash_program_rmw` (erase+program), `flash_chip_erase` (single 64 KB block). **No** read-back verify on program and **no** blank-verify on erase. All real flash work goes through the three thunks.
 
 ### `spifi_glue.c`
 
-The imported-driver boundary: the request-struct ABI, the request/context BSS objects, and the three flash-resident thunks (`spifi_drv_init_thunk` / `_program_thunk` / `_op_thunk`) that branch into the relocated driver at `0x10010000`. The driver bytes themselves are imported. Documents the relocation formula and the cross-boundary `memcpy_bytes_thunk`.
+The imported-driver boundary: the request-struct ABI, the request/context BSS objects, and the three flash-resident thunks (`spifi_drv_init_thunk` / `_program_thunk` / `_op_thunk`, each taking the single context argument) that branch into the relocated driver at `0x10010000`. The driver bytes themselves are imported. Documents the relocation formula and the cross-boundary `memcpy_bytes_thunk`.
 
 ### `keys.c`
 
@@ -524,7 +541,7 @@ The embedded key material and config base: `g_key_mask` (Key A and the silicon m
 
 ### `ld/lpc43xx_spifi_boot.ld`
 
-The custom layout: vectors at `0x14000000`, the flash-resident `.text_boot`, the scatter-load section table (copy `.data`, copy the driver `.text_ram`, zero `.bss`), the driver `.text_ram` relocated to `0x10010000`, `.data` to `0x10011D70`, `.bss` (NOLOAD) at `0x10011ED0`, and stack top `0x10018000`.
+The custom layout: vectors at `0x14000000`, the flash-resident boot text, the scatter-load section table (copy `.data`, zero `.bss`, copy the driver `.text_ram`), the driver `.text_ram` relocated to `0x10010000` (LMA `0x14000BE8`), `.data` to `0x10011D70` (LMA `0x1400297C`), `.bss` (NOLOAD) at `0x10011ED0`, build-info at `0x14002958`, and stack top `0x10018000`.
 
 ---
 
@@ -583,22 +600,24 @@ The manually assigned labels are preserved verbatim so source and listing line u
 | Function                                  | Name suggests                | Actually does                                                                                                                               |
 | ----------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `stream_decrypt_skip_header` (0x1400093c) | a third single-key decryptor | runs **two** keystreams (`out = cipher ^ ksA ^ ksB`) to convert Key-A → Key-B form — **renamed** here `stream_reencrypt_keyA_to_keyB`       |
+| `stream_decrypt_skip_header` (0x140009f8) | one function                 | disassembler splits it into `_entry`/`_body` sharing one frame; it is one routine `stream_decrypt_skip_header(dst, src, len)`               |
 | `stream_checksum16` / `_copy2`            | a 16-bit / mod-2¹⁶ sum       | accumulates and compares the **full 32-bit** decrypted-word sum against `0x00000000`; also returns a vestigial raw sum through an out-param |
 | `image_try_keys` / `_copy2`               | "tries keys" (plural)        | each tries exactly **one** key — `image_try_keys` = Key A (transport detect), `_copy2` = Key B (boot gate)                                  |
 | `prng_seed_from_key`                      | a generic key seeder         | seeds **only** the Key-B / silicon-derived path; the Key-A seed is inlined at its call sites                                                |
 | `flash_chip_erase`                        | erases the whole device      | erases the **single 64 KB block** containing `addr` (fixed `0x10000` length, no blank-verify)                                               |
+| `flash_program_rmw`                       | a block read-modify-write    | just **erases then programs** the range (staged); no read-back of surrounding bytes                                                         |
 
 ---
 
 ## 20. Reconstruction caveats (load-bearing assumptions)
 
-These assumptions are load-bearing — losing them will break a build or mislead an analyst. The crypto path, scatter tables, key/marker constants, and slot geometry are **byte-confirmed** against the dump (see [§22](#22-verifying-the-reconstruction)); what remains inferred:
+These assumptions are load-bearing — losing them will break a build or mislead an analyst. The crypto path, scatter tables, key/marker constants, slot geometry, and the minimal CRT0 are **byte-confirmed** against the dump (see [§22](#22-verifying-the-reconstruction)); what remains inferred:
 
-- **The SPIFI driver blob is imported, not sourced.** It is **not** lpcspifilib — it is a bespoke driver that pokes the SPIFI registers at `0x40003000` and switches per vendor by JEDEC ID. The reconstruction reproduces only its **call surface** (the three-thunk + request-struct ABI in `spifi_glue.c`/`flash_if.c`); the driver bytes (flash `0x14000BE8`–`0x14002958`) must be supplied to build a runnable image.
-- **The request-struct field map** (`flash_offset/length/stage_buf/sentinel/opcode` at `+0x00/04/08/0C/10`) and the three thunk entry points (`0x100105FF` init, `0x10010E95` program, `0x100110EB` op/erase) are read off the call sites; confirm them against the blob you vendor.
+- **The SPIFI driver is reconstructed, not vendored.** It reproduces the driver's behaviour at the three confidence tiers in [§6](#6-what-is-reconstructed-vs-imported); the **byte-derived** vendor and probe/entry regions are documentation-grade and not bit-verifiable. For a runnable image, retain the original relocated blob bytes for those regions. The request-struct field map and the three RAM entry points are confirmed from the call sites; the internal sequencing of the entries is inferred.
+- **The request-struct field map** (`flash_offset/length/stage_buf/sentinel/opcode` at `+0x00/04/08/0C/10`, sentinel `0`) and the three thunk entry points (`0x100105FF` init, `0x10010E95` program, `0x100110EB` op/erase) are read off the call sites; confirm them against the blob you vendor.
 - **Segmented-path table offsets** — pass-1's `{srcRef, dstVMA, byteLen}` descriptor format is byte-confirmed on this dump (`{0x14009960, 0x10000000, 0x240}`); the BSS `[156..]` and pass-2 `[164..]` struct semantics are **inferred** by symmetry.
-- **The warm-boot mailbox flag→request mapping** (`0xAA55FF01 → 1`, `0xAA55FF02 → 2`) is inferred; the gate predicates (`flag ∈ {…}`, `gate ≤ 0x752F`) are confirmed.
-- **The RGU reset masks** (`0x10DF1000` / `0x01DFF7FF`) match the 2019 iOS build's sequence; if this revision differs, only those two literals change.
+- **The warm-boot mailbox gate predicates** (`flag ∈ {0xAA55FF01, 0xAA55FF02}`, `gate ≤ 0x752F`) are confirmed; the _raw_ flag is passed to `select_boot_slot` (it is not remapped). The rollback's two `flash_program_rmw` writes are confirmed.
+- **The RGU reset masks** (`0x10DF1000` / `0x01DFF7FF`) are taken from the literal pool; if a revision differs, only those two literals change.
 - **The silicon-Key-B path** (`0x40045000` device-ID XOR mask) is reconstructed but **unexercised** by this dump (its marker selects the fixed key).
 
 ---
@@ -607,7 +626,7 @@ These assumptions are load-bearing — losing them will break a build or mislead
 
 These look like bugs but are faithfully reproduced because they are in the original machine code:
 
-- **`spifi_init` skips P3_3 and writes P3_4 twice** — the pin-mux configures `P3_4..P3_8` (the 2019 iOS build set `P3_3..P3_8`), and `P3_4` is written `0xF3` then immediately overwritten with `0xD3`. Both are reproduced verbatim.
+- **`spifi_init` skips P3_3 and writes P3_4 twice** — the pin-mux configures `P3_4..P3_8`, and `P3_4` is written `0xF3` then immediately overwritten with `0xD3`. Both are reproduced verbatim.
 - **`flash_chip_erase` erases one fixed 64 KB block** despite its name, and performs no blank-verify (and the program/erase paths perform no read-back verify).
 - **The checksum routines return a vestigial raw-ciphertext sum** through a second out-param that no caller reads.
 - **`memcpy_bytes_thunk` is a RAM→flash cross-boundary call** — it relocates into SRAM with the driver blob but branches back to `memcpy_bytes` in flash (`0x14000844`).
@@ -646,21 +665,43 @@ Image identity: 4,194,304 bytes, SHA-256 `db4efc84f5338815ef9e4fa8b8242d9d8fdfad
 
 ---
 
-## 24. Relationship to the 2019 iOS build
+## 24. Relationship to the sibling builds
 
-A closely related LPC43xx bootloader ships on the Compact Pro **iOS** variant, built `Jan 7 2019` (marker `{C9,12,03,00}`, internal name `80K_43X0_Bootloader`). It is the same product family and toolchain lineage, and the two share the magic/segment-table format, the xorshift128 algorithm family, the slot/config model, and the overall boot intent.
+### 24.1 The Compact Pro FF (LQ-XXX) build — the near-twin
 
-The substantive differences below track the **~2.5-year build-date gap** (`Jun 26 2016` here vs `Jan 7 2019` there) — they are firmware-lineage evolution, **not** a consequence of the host OS. The bootloader does not care which phone OS the device pairs with; "iOS" and "Android" here are just the two captured builds, and the older one is simply structured differently. The load-bearing differences, for anyone cross-referencing the two:
+The closest relative is the Compact Pro **FF** image (product code LQ-XXX), reconstructed in the sibling repository. The two were built **31 seconds apart** on the same day from a near-identical tree:
 
-- **Runs from flash, not RAM.** This (2016) image executes its entire boot pipeline in place (XIP) inside `Reset_Handler`; the 2019 build relocated all of its code to SRAM and ran a separate `boot_main` stage there. Here, only the SPIFI driver blob is relocated.
-- **Bespoke SPIFI driver, not lpcspifilib.** This image carries a hand-written register-level driver (imported as a blob, reached through three thunks); the 2019 build wrapped NXP lpcspifilib.
-- **Two keys + a boot-time A→B migration.** The 2019 build had a single key path (Key B / optional per-device slot); this image distinguishes a transport Key A from an at-rest Key B and re-encrypts slots at boot.
-- **No whitening, sentinel 0.** Seeds are taken from the key words directly (the 2019 build XORed `0x13579BDF`); the checksum sentinel is `0x00000000` (the 2019 build used `0x0000FFFF`).
-- **Segmented-only.** No monolithic path and no "CODE" footer (the 2019 build had both).
-- **All-trap vector table.** No live peripheral IRQ handlers (the 2019 build installed three on IRQ12/13/14); core faults spin with a plain `B .` rather than `WFI`.
-- **Different geometry and identity.** Initial SP `0x10018000` (2019 build `0x10020000`); 64 KB slots at `0x14050000`/`0x14060000`/`0x14070000`, stride `0x10000` (2019 build `0x20000`); marker `{01,02,00,00}` / `Jun 26 2016` and **no** internal name string (2019 build `{C9,12,03,00}` / `Jan 7 2019` / `80K_43X0_Bootloader`).
+|                                | UQ-AAA (this image)                  | LQ-XXX (FF sibling)              |
+| ------------------------------ | ------------------------------------ | -------------------------------- |
+| Build time                     | `11:08:15`                           | `11:08:46` (+31 s)               |
+| Marker / date                  | `{01,02,00,00}` / `Jun 26 2016`      | same                             |
+| SHA-256                        | `db4efc84…`                          | `195f5338…`                      |
+| Key A / mask                   | `67 A3 EA 21 …`                      | `58 D6 AB E5 …`                  |
+| Key B fixed                    | `FA AC B3 C6 …`                      | `6D A0 5A 33 …`                  |
+| `xorshift128_next`             | **inlined** into each routine        | **standalone** exported function |
+| `image_checksum_ok` / `_copy2` | **separate** tail-called routines    | **fused** into the gates inline  |
+| `Reset_Handler`                | `0x14000264`, `PUSH {R4-R11,LR}`     | `0x14000262`, `PUSH {R4-R7,LR}`  |
+| Driver blob LMA                | `0x14000BE8`                         | `0x14000A28`                     |
+| `.data` / build-info LMA       | `0x1400297C` / `0x14002958`          | `0x140027BC` / `0x14002798`      |
+| Boot decision (these dumps)    | **slot A** (all 3 slots Key-B valid) | **recovery** (A/B blank)         |
 
-This section is for cross-reference only; the rest of this document stands on its own against the present image.
+Everything else is identical: the magic/segment-table format, the xorshift128 (11/19/8) scheme and `[k1,k2,k3,k0]` no-whitening seed, the two-key A→B migration, the slot/config geometry, the warm-boot mailbox gate, the all-trap vector table, and the relocated bespoke SPIFI driver (same RAM entry points `0x100105FF`/`0x10010E95`/`0x100110EB`). Because the FF build **factored the inlined PRNG into one shared routine and fused the checksum into the gates**, its boot code is `0x1C0` bytes smaller — which is the _entire_ reason every address from the driver blob onward is shifted earlier in the FF image. The two app payloads install the **same** MSP (`0x1000A000`) and entry (`0x100806A5`); UQ-AAA simply carries a bootable Key-B image in all three slots where the FF dump carries one only in recovery.
+
+This repository is laid out so a diff against the FF repo shows exactly those genuine deltas — the keys, the build time, the `+0x1C0` addresses, the inlined `static` `xorshift128_next`, and the separate `image_checksum_ok` / `_copy2` — and nothing else.
+
+### 24.2 The 2019 iOS build — the older lineage
+
+A more distant relative ships on the Compact Pro **iOS** variant, built `Jan 7 2019` (marker `{C9,12,03,00}`, internal name `80K_43X0_Bootloader`). It is the same product family and toolchain lineage and shares the magic/segment-table format, the xorshift128 algorithm family, the slot/config model, and the overall boot intent — but the differences track the **~2.5-year build-date gap** and are firmware-lineage evolution, **not** a consequence of the host OS:
+
+- **Runs from RAM, not flash.** The 2019 build relocated all of its code to SRAM and ran a separate `boot_main` stage there; this (2016) image executes its entire pipeline in place (XIP), relocating only the SPIFI driver blob.
+- **lpcspifilib, not a bespoke driver.** The 2019 build wrapped NXP lpcspifilib; this image carries a hand-written register-level driver reached through three thunks.
+- **Single key.** The 2019 build had a single key path; this image distinguishes a transport Key A from an at-rest Key B and re-encrypts slots at boot.
+- **Whitening + different sentinel.** The 2019 build XORed `0x13579BDF` into every seed word and accepted at checksum `0x0000FFFF`; this image seeds directly (no whitening) and accepts at `0x00000000`.
+- **Monolithic + segmented.** The 2019 build had a monolithic path and a "CODE" footer; this image is segmented-only.
+- **Live IRQ handlers.** The 2019 build installed three live RAM handlers on IRQ12/13/14 and its fault handlers executed `WFI`; this image is all-trap and spins with a plain `B .`.
+- **Different geometry/identity.** Initial SP `0x10018000` (2019: `0x10020000`); 64 KB slots, stride `0x10000` (2019: `0x20000`); marker `{01,02,00,00}` with **no** internal name string (2019: `{C9,12,03,00}` / `80K_43X0_Bootloader`).
+
+These sections are for cross-reference only; the rest of this document stands on its own against the present image.
 
 ---
 
@@ -670,7 +711,7 @@ This section is for cross-reference only; the rest of this document stands on it
 - **Driver ABI pinning:** confirm the request-struct field offsets and the three thunk entry points against the blob revision you vendor.
 - **Silicon Key-B path:** unexercised by this dump (the marker selects the fixed key); validate the `0x40045000` device-ID derivation against a unit that uses it, if one is captured.
 - **Segmented table layout:** pass-1 is byte-confirmed; the inferred BSS / pass-2 descriptor semantics deserve validation against a second sample.
-- **Mailbox flag→request mapping:** the `0xAA55FF01→1 / 0xAA55FF02→2` derivation is inferred; confirm against a unit that exercises the warm-boot rollback.
+- **Mailbox rollback:** the gate predicates are confirmed and the raw flag is passed through; confirm the end-to-end rollback against a unit that exercises the warm-boot path.
 
 Potential follow-up artifacts:
 
@@ -693,7 +734,7 @@ Potential follow-up artifacts:
 
 ## 27. References
 
-- **NXP LPC43xx User Manual (UM10503)** — SPIFI, CREG (`M4MEMMAP`), RGU, SCU, NVIC register details.
+- **NXP LPC43xx User Manual (UM10503)** — SPIFI, CREG, RGU, SCU, NVIC register details.
 - **ARMv7-M Architecture Reference Manual** — Cortex-M4 reset behavior, vector table, VTOR, `MSP`.
 - **NXP LPCOpen** — chip layer (CMSIS + peripheral drivers) for LPC43xx.
 - **JEDEC JESD216 (SFDP)** — Serial Flash Discoverable Parameters, used by the bespoke driver's device detection.
